@@ -1,146 +1,181 @@
-# -*- coding: utf-8 -*-
 from datetime import datetime
 from datetime import timedelta
 import requests
 from cloudbot import hook
 from cloudbot.bot import bot
-from cloudbot.util import colors
+from cloudbot.util import colors, web
 
 # config
-key = bot.config.get_api_key("itad")
-region = 'br2'
-country = 'BR'
-shop_list = ['steam', 'gog', 'nuuvem', 'greenmangaming']
-since_months = 3 # how many months to check for previous sales in historical data
+KEY = bot.config.get_api_key("itad")
+REGION = 'br2'
+COUNTRY = 'BR'
+SHOPS = ','.join(['steam', 'gog', 'nuuvem', 'greenmangaming'])
+SINCE_MONTHS = 3 # how many months to check for previous sales in historical data
+SINCE = str(int(datetime.now().timestamp()) - SINCE_MONTHS * 30 * 24 * 60 * 60)
+API_URL = 'https://api.isthereanydeal.com'
 
-
-def convert_to_brl(currency):
+# formats value in brl
+def format_to_brl(currency):
+    """returns formatted currency"""
     formatted_brl = 'R$ {:,.2f}'.format(currency)
     formatted_brl = formatted_brl.translate(str.maketrans(',.', '.,'))
     return formatted_brl
 
-def shorten_url(url):
-    shortened = requests.get('https://is.gd/create.php?format=simple&url={}'.format(url))
-    return shortened.text
-
-def get_results(query):
-    search_url = 'https://api.isthereanydeal.com/v02/search/search/?key={}&q={}'.format(key, query)
-    search_request = requests.get(search_url)
-    if search_request.status_code == 200 and search_request.headers['Content-Type'] == 'application/json':
-        search_results_json = search_request.json()
-        if 'error' in search_results_json:
-            return 0
-    else:
-        return 1
-    results = search_results_json['data']['results']
-    return results
-
-def get_game_data(results, index=1):
+def get_game_data(session, results, index=1):
+    """returns final formatted result"""
     results_len = len(results)
     plain = results[index - 1]['plain']
     title = results[index - 1]['title']
 
+    # build output
     output = '[{}/{}] $(bold){}$(clear) '.format(index, results_len, title)
-    
-    today_timestamp = int(datetime.now().timestamp())
-    since_timestamp = since_months * 30 * 24 * 60 * 60
-    since = str(today_timestamp-since_timestamp)
-    shops = ','.join(shop_list)
 
-    game_prices = 'https://api.isthereanydeal.com/v01/game/prices/?key={}&plains={}&region={}&country={}&shops={}'.format(key, plain, region, country, shops)
-    game_overview = 'https://api.isthereanydeal.com/v01/game/overview/?key={}&region={}&country={}&plains={}'.format(key, region, country, plain)
-    game_history = 'https://api.isthereanydeal.com/v01/game/lowest/?key={}&plains={}&region={}&country={}&since={}&new=1'.format(key, plain, region, country, since)
+    # set params for requests
+    params = {"key": KEY, "region": REGION, "country": COUNTRY, "plains": plain}
+    params_prices = {**params, "shops": SHOPS}
+    params_history = {**params, "since": SINCE, "new": 1}
 
-    game_prices_request = requests.get(game_prices)
+    # set urls
+    game_prices = '{}/v01/game/prices/'.format(API_URL)
+    game_overview = '{}/v01/game/overview/'.format(API_URL)
+    game_history = '{}/v01/game/lowest/'.format(API_URL)
+
+    # get game data
+    try:
+        # get prices
+        game_prices_request = session.get(game_prices, params=params_prices)
+        print(game_prices_request.url)
+        game_prices_request.raise_for_status()
+
+        # to get lowest of all time
+        game_overview_request = session.get(game_overview, params=params)
+        print(game_overview_request.url)
+        game_overview_request.raise_for_status()
+
+        # to get recent low
+        game_history_request = session.get(game_history, params=params_history)
+        print(game_history_request.url)
+        game_history_request.raise_for_status()
+
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError) as err:
+        print(err)       
+        return "Could not get game info."
+
     game_prices_json = game_prices_request.json()
-
-    game_overview_request = requests.get(game_overview)
     game_overview_json = game_overview_request.json()
-
-    game_history_request = requests.get(game_history)
     game_history_json = game_history_request.json()
 
+    # recent low price dict
     if 'price' in game_history_json['data'][plain]:
         recent_low_dict = {
             'price': game_history_json['data'][plain]['price'],
             'date': game_history_json['data'][plain]['added'],
             'store': game_history_json['data'][plain]['shop']['name'],
-            'diff': timedelta(seconds=today_timestamp - game_history_json['data'][plain]['added']).days
+            'diff': timedelta(seconds=int(datetime.now().timestamp()) - game_history_json['data'][plain]['added']).days
         }
-        
     else:
         recent_low_dict = None
 
-    game_info_url = 'https://isthereanydeal.com/game/{}/info'.format(plain)
-    
-    if not game_prices_json['data'][plain]['list']:
-        output += "No data about this game with the selected stores. More info: {}".format(shorten_url(game_info_url))
-        return colors.parse(output)
-    
-    game_price_list = game_prices_json['data'][plain]['list']
-    game_overview_historical_low = game_overview_json['data'][plain]['lowest']
+    # game url
+    game_info_url = web.try_shorten('https://isthereanydeal.com/game/{}/info'.format(plain))
 
+    # game exists but not in the selected store
+    if not game_prices_json['data'][plain]['list']:
+        output += "No data about this game with the selected stores. More info: {}".format(game_info_url)
+        return colors.parse(output)
+
+    game_price_list = game_prices_json['data'][plain]['list']
+    game_recent_low = game_overview_json['data'][plain]['lowest']
+
+    # lowest price dict
     historical_dict = {
-        'price': game_overview_historical_low['price'],
-        'date': game_overview_historical_low['recorded_formatted'],
-        'store': game_overview_historical_low['store']
+        'price': game_recent_low['price'],
+        'date': game_recent_low['recorded_formatted'],
+        'store': game_recent_low['store']
     }
 
-    prices_list = []
-    for i in game_price_list:
-        prices_list.append({'store': i['shop']['name'], 'price_cut': i['price_cut'], 'price_old': i['price_old'], 'price_new': i['price_new'], 'drm': i['drm'], 'url': i['url']})
+    # create prices list with data for each game
+    prices_list = [({'store': i['shop']['name'],
+                     'price_cut': i['price_cut'],
+                     'price_old': i['price_old'],
+                     'price_new': i['price_new'],
+                     'drm': i['drm'],
+                     'url': i['url']}) for i in game_price_list]
 
+    # format price data
     prices_string = ''
-    price_cut = ''
-
     for i in prices_list:
         if i['price_cut'] > 0:
-            price_cut = ' ($(dgreen, bold)-{}%$(clear), was $(bold){}$(clear))'.format(i['price_cut'], convert_to_brl(i['price_old']))
+            price_cut = ' ($(dgreen, bold)-{}%$(clear), was $(bold){}$(clear))'.format(i['price_cut'],
+                                                                                       format_to_brl(i['price_old']))
         else:
-            price_cut = '{}%'.format(i['price_cut'])            
-        prices_string += '⦁ $(bold){}$(clear): $(bold){}$(clear){} '.format(i['store'], convert_to_brl(i['price_new']), price_cut if i['price_cut'] > 0 else '')
+            price_cut = '{}%'.format(i['price_cut'])
+        prices_string += '⦁ {}: $(bold){}$(clear){} '.format(i['store'],
+                                                             format_to_brl(i['price_new']),
+                                                             price_cut if i['price_cut'] > 0 else '')
 
-    historical_string = '[$(bold)All time low$(clear): $(bold){}$(clear) on $(bold){}$(clear), {}]'.format(convert_to_brl(historical_dict['price']), historical_dict['store'], historical_dict['date'])
-    
-    recent_string = '[$(bold)Last {}{}$(clear): $(bold){}$(clear) on $(bold){}$(clear), {} days ago]'.format(since_months if since_months > 1 else '', ' months' if since_months > 1 else 'month', convert_to_brl(recent_low_dict['price']), recent_low_dict['store'], recent_low_dict['diff'])
+    # all time low string
+    historical_string = '[All time low: $(bold){}$(clear) on $(bold){}$(clear), {}]'.format(format_to_brl(historical_dict['price']),
+                                                                                            historical_dict['store'],
+                                                                                            historical_dict['date'])
+    # las x months string
+    recent_string = '[Last {}{}: $(bold){}$(clear) on $(bold){}$(clear), {} {} ago]'.format(SINCE_MONTHS if SINCE_MONTHS > 1 else '',
+                                                                                            ' months' if SINCE_MONTHS > 1 else 'month',
+                                                                                            format_to_brl(recent_low_dict['price']),
+                                                                                            recent_low_dict['store'], recent_low_dict['diff'],
+                                                                                            'days' if recent_low_dict['diff'] > 1 else 'day')
 
-    output += '{}{} {} - {}'.format(prices_string, historical_string, '' if recent_low_dict == None else recent_string, shorten_url(game_info_url))
+    # final output
+    output += '{}{} {} - {}'.format(prices_string, historical_string,
+                                    '' if recent_low_dict is None else recent_string,
+                                    game_info_url)
 
     return colors.parse(output)
 
-@hook.command('isthereanydeal', 'itad', autohelp=False)
+@hook.command('isthereanydeal', 'itad', autohelp=True)
 def isthereanydeal(text):
-    """<game title> [, index] - Returns the game entry from isthereanydeal.com"""    
-    if text:
-        cleaned_query = text.strip()  
-        split_query = cleaned_query.split(',')
-        cleaned_split_query = [i.strip() for i in split_query]
-        actual_query = ' '.join(cleaned_split_query)
+    """<game title>[, index] - Returns the game entry from isthereanydeal.com"""
+    cleaned_query = text.strip()  
+    split_query = cleaned_query.split(',')
+    cleaned_split_query = [i.strip() for i in split_query]
+    actual_query = ' '.join(cleaned_split_query)
+    index = 1
+
+    if len(cleaned_split_query) > 1 and cleaned_split_query[-1].isdigit():
+        actual_query = ' '.join(cleaned_split_query[:-1])
+        index = abs(int(cleaned_split_query[-1]))
+
+    # returns first item if index < 1
+    if index < 1:
         index = 1
 
-        if len(cleaned_split_query) > 1 and cleaned_split_query[-1].isdigit():
-            actual_query = ' '.join(cleaned_split_query[:-1])
-            index = abs(int(cleaned_split_query[-1]))
+    # create sessions and get results in json data
+    session = requests.Session()
+    search_url = '{}/v02/search/search/?key={}&q={}'.format(API_URL, KEY, actual_query)
+    try:
+        search_request = session.get(search_url)
+        print(search_request.url)
+        search_request.raise_for_status()
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError):
+        return "Could not get game info."
+    
+    search_results_json = search_request.json()
 
-        if index < 1:
-            index = 1
+    # some queries can return error
+    if 'error' in search_results_json:
+        return "Invalid query"
+    
+    results = search_results_json['data']['results']
 
-        results = get_results(actual_query)
+    # some queries have no results
+    if not results:
+        return 'No results for "{}".'.format(actual_query)
 
-        if results == 0:
-            return 'Invalid query.'
+    # return last item if index > total items
+    if index > len(results):
+        index = len(results)
 
-        if results == 1:
-            return 'API failure.'
+    game_data = get_game_data(session, results, index)
 
-        if not results:
-            return 'No results for "{}".'.format(actual_query)
-
-        if index > len(results):
-            index = len(results)
-
-        game_data = get_game_data(results, index)
-
-        return game_data
-    return 'Usage: <game title> [, id]'
+    return game_data
     
